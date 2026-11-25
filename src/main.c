@@ -19,19 +19,42 @@
  * Transmission rate: 10 packets/s
  ************************************************************/
 
+#include <errno.h>
+
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
+
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 
-/************************************************************
- * 1. Device configuration
- ************************************************************/
+#include <hal/nrf_saadc.h>
 
 #define DEVICE_NAME "StretchSense"
+
+/* 原理图：ADC_CH1=P0.02/AIN0，ADC_CH2=P0.03/AIN1 */
+/*不知道为什么这个芯片上物理引脚上电压都能对的上，但是发出去和接收的CH1和CH2是反的，所以变成了CH1是0，CH2是1
+而且，这个CH1本来在物理引脚13上的，但是一直收不到数据，而且会受到CH2的变化而变化。
+所以这个时候找到了一个解决方法，将物理引脚13和物理引脚15短接，这样就能稳定收到了，不知道为什么。
+*/
+#define ADC_CHANNEL_CH1 0
+#define ADC_CHANNEL_CH2 1
+#define ADC_PIN_CH1 NRF_SAADC_INPUT_AIN1 
+#define ADC_PIN_CH2 NRF_SAADC_INPUT_AIN0
+
+/* 原理图：EXC_CH1=P0.13，EXC_CH2=P0.14 */
+#define EXC_CH1_PIN 13
+#define EXC_CH2_PIN 14
+
+#define ADC_RESOLUTION 12
+#define ADC_ACQUISITION_TIME \
+    ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)
 
 #define BT_UUID_SENSOR_SERVICE_VAL \
     BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, \
@@ -47,19 +70,100 @@
 #define BT_UUID_SENSOR_DATA \
     BT_UUID_DECLARE_128(BT_UUID_SENSOR_DATA_VAL)
 
-/************************************************************
- * 2. Global variables
- ************************************************************/
+static bool send_enabled;
+static bool ble_connected;
 
-static bool send_enabled = false;
-static bool ble_connected = false;
+static const struct device *adc_dev =
+    DEVICE_DT_GET(DT_NODELABEL(adc));
+static const struct device *gpio0_dev =
+    DEVICE_DT_GET(DT_NODELABEL(gpio0));
 
-static uint16_t ch1 = 1000;
-static uint16_t ch2 = 2000;
+static uint16_t ch1;
+static uint16_t ch2;
 
-/************************************************************
- * 3. Advertising data
- ************************************************************/
+/* 初始化 EXC 输出和两个 SAADC 输入通道 */
+static int sensor_io_init(void)
+{
+    if (!device_is_ready(adc_dev)) {
+        printk("SAADC device is not ready.\n");
+        return -ENODEV;
+    }
+
+    if (!device_is_ready(gpio0_dev)) {
+        printk("GPIO0 device is not ready.\n");
+        return -ENODEV;
+    }
+
+    int err = gpio_pin_configure(
+        gpio0_dev, EXC_CH1_PIN, GPIO_OUTPUT_ACTIVE);
+    if (err) {
+        printk("Failed to configure EXC_CH1: %d\n", err);
+        return err;
+    }
+
+    err = gpio_pin_configure(
+        gpio0_dev, EXC_CH2_PIN, GPIO_OUTPUT_ACTIVE);
+    if (err) {
+        printk("Failed to configure EXC_CH2: %d\n", err);
+        return err;
+    }
+
+    const struct adc_channel_cfg ch1_cfg = {
+        .gain = ADC_GAIN_1_4,
+        .reference = ADC_REF_VDD_1_4,
+        .acquisition_time = ADC_ACQUISITION_TIME,
+        .channel_id = ADC_CHANNEL_CH1,
+        .input_positive = ADC_PIN_CH1,
+    };
+
+    const struct adc_channel_cfg ch2_cfg = {
+        .gain = ADC_GAIN_1_4,
+        .reference = ADC_REF_VDD_1_4,
+        .acquisition_time = ADC_ACQUISITION_TIME,
+        .channel_id = ADC_CHANNEL_CH2,
+        .input_positive = ADC_PIN_CH2,
+    };
+
+    err = adc_channel_setup(adc_dev, &ch1_cfg);
+    if (err) {
+        printk("Failed to configure ADC_CH1: %d\n", err);
+        return err;
+    }
+
+    err = adc_channel_setup(adc_dev, &ch2_cfg);
+    if (err) {
+        printk("Failed to configure ADC_CH2: %d\n", err);
+        return err;
+    }
+
+    printk("Sensor I/O ready: CH1=P0.02/AIN0, CH2=P0.03/AIN1, "
+           "EXC1=P0.13, EXC2=P0.14.\n");
+
+    return 0;
+}
+
+/* 在同一个 ADC sequence 中读取两路输入，缓冲区顺序与 channel_id 一致 */
+static int sensor_read(uint16_t *ch1_value, uint16_t *ch2_value)
+{
+    int16_t samples[2] = {0};
+
+    const struct adc_sequence sequence = {
+        .channels = BIT(ADC_CHANNEL_CH1) | BIT(ADC_CHANNEL_CH2),
+        .buffer = samples,
+        .buffer_size = sizeof(samples),
+        .resolution = ADC_RESOLUTION,
+    };
+
+    int err = adc_read(adc_dev, &sequence);
+    if (err) {
+        return err;
+    }
+
+    *ch1_value = (uint16_t)MAX(samples[0], 0);
+    *ch2_value = (uint16_t)MAX(samples[1], 0);
+
+    return 0;
+}
 
 static const struct bt_data advertising_data[] = {
     BT_DATA_BYTES(
@@ -72,10 +176,6 @@ static const struct bt_data advertising_data[] = {
         sizeof(DEVICE_NAME) - 1
     ),
 };
-
-/************************************************************
- * 4. Advertising restart work
- ************************************************************/
 
 static void advertising_start_handler(struct k_work *work);
 
@@ -104,17 +204,12 @@ static void advertising_start_handler(struct k_work *work)
         printk("Advertising started successfully.\n");
     } else {
         printk("Advertising start failed: %d. Retrying...\n", err);
-
         k_work_schedule(
             &advertising_start_work,
             K_SECONDS(1)
         );
     }
 }
-
-/************************************************************
- * 5. GATT CCC callback
- ************************************************************/
 
 static void ccc_changed(
     const struct bt_gatt_attr *attr,
@@ -123,18 +218,10 @@ static void ccc_changed(
 {
     ARG_UNUSED(attr);
 
-    if (value == BT_GATT_CCC_NOTIFY) {
-        send_enabled = true;
-        printk("Notification enabled.\n");
-    } else {
-        send_enabled = false;
-        printk("Notification disabled.\n");
-    }
+    send_enabled = (value == BT_GATT_CCC_NOTIFY);
+    printk("Notification %s.\n",
+           send_enabled ? "enabled" : "disabled");
 }
-
-/************************************************************
- * 6. Custom GATT Service
- ************************************************************/
 
 BT_GATT_SERVICE_DEFINE(
     sensor_service,
@@ -156,10 +243,6 @@ BT_GATT_SERVICE_DEFINE(
     )
 );
 
-/************************************************************
- * 7. BLE connection callbacks
- ************************************************************/
-
 static void connected(struct bt_conn *conn, uint8_t err)
 {
     ARG_UNUSED(conn);
@@ -170,11 +253,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
     }
 
     ble_connected = true;
-
-    k_work_cancel_delayable(&advertising_start_work);
-
     send_enabled = false;
 
+    k_work_cancel_delayable(&advertising_start_work);
     printk("BLE connected.\n");
 }
 
@@ -190,11 +271,6 @@ static void disconnected(
 
     printk("BLE disconnected: %u\n", reason);
 
-    /*
-     * Restart advertising outside the connection callback.
-     * A short delay allows the BLE connection state to settle.
-     */
-
     k_work_schedule(
         &advertising_start_work,
         K_MSEC(500)
@@ -205,10 +281,6 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .connected = connected,
     .disconnected = disconnected,
 };
-
-/************************************************************
- * 8. Sensor data generation and transmission
- ************************************************************/
 
 static void sensor_work_handler(struct k_work *work);
 
@@ -221,16 +293,16 @@ static void sensor_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    ch1 += 7;
-    ch2 += 11;
-
-    if (ch1 > 3000) {
-        ch1 = 1000;
+    int err = sensor_read(&ch1, &ch2);
+    if (err) {
+        printk("SAADC read failed: %d\n", err);
+        k_work_schedule(&sensor_work, K_MSEC(100));
+        return;
     }
 
-    if (ch2 > 3500) {
-        ch2 = 1500;
-    }
+    printk("SAADC raw: CH1=%u CH2=%u\n",
+           (unsigned int)ch1,
+           (unsigned int)ch2);
 
     uint8_t data[4];
 
@@ -238,8 +310,7 @@ static void sensor_work_handler(struct k_work *work)
     sys_put_le16(ch2, &data[2]);
 
     if (send_enabled && ble_connected) {
-
-        int err = bt_gatt_notify(
+        err = bt_gatt_notify(
             NULL,
             &sensor_service.attrs[2],
             data,
@@ -251,27 +322,23 @@ static void sensor_work_handler(struct k_work *work)
         }
     }
 
-    k_work_schedule(
-        &sensor_work,
-        K_MSEC(100)
-    );
+    k_work_schedule(&sensor_work, K_MSEC(100));
 }
-
-/************************************************************
- * 9. Main function
- ************************************************************/
 
 int main(void)
 {
-    int err;
-
     printk("\n");
     printk("================================\n");
     printk("     StretchSense BLE Sensor\n");
     printk("================================\n");
 
-    err = bt_enable(NULL);
+    int err = sensor_io_init();
+    if (err) {
+        printk("Sensor I/O initialization failed: %d\n", err);
+        return 0;
+    }
 
+    err = bt_enable(NULL);
     if (err) {
         printk("Bluetooth initialization failed: %d\n", err);
         return 0;
@@ -279,18 +346,10 @@ int main(void)
 
     printk("Bluetooth initialized successfully.\n");
 
-    /*
-     * Start advertising through the work queue.
-     */
-
     k_work_schedule(
         &advertising_start_work,
         K_NO_WAIT
     );
-
-    /*
-     * Start sensor data generation.
-     */
 
     k_work_schedule(
         &sensor_work,
